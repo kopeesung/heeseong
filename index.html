@@ -1224,14 +1224,15 @@ function getApiUrl() {
 // ── 클라이언트 메모리 캐시 ────────────────────────────────────
 const MEM_CACHE = {};
 const CACHE_MS = {
-  getDashboard: 30000,   // 30초
-  getMembers:   300000,  // 5분
-  getGoals:     60000,   // 60초
-  getAssets:    60000,   // 60초
-  getBudgets:   300000,  // 5분
-  getCategories:600000,  // 10분
-  getPayMethods:600000,  // 10분
-  getActivity:  15000,   // 15초
+  getDashboard: 60000,    // 1분
+  getAll:       60000,    // 1분
+  getMembers:   600000,   // 10분
+  getGoals:     120000,   // 2분
+  getAssets:    120000,   // 2분
+  getBudgets:   600000,   // 10분
+  getCategories:3600000,  // 1시간
+  getPayMethods:3600000,  // 1시간
+  getActivity:  30000,    // 30초
 };
 // 데이터 변경 시 관련 캐시 무효화
 const INVALIDATE_ON = {
@@ -1343,7 +1344,7 @@ async function call(params) {
 function startPoll() {
   if (S.timer) clearInterval(S.timer);
   doPoll();
-  const interval = document.hidden ? 60000 : 15000;
+  const interval = document.hidden ? 120000 : 45000;
   S.timer = setInterval(doPoll, interval);
 }
 
@@ -1394,10 +1395,13 @@ function go(pg) {
   document.querySelectorAll('.ni').forEach(e => {
     if (e.getAttribute('onclick')?.includes("'" + pg + "'")) e.classList.add('on');
   });
-  // 캐시 즉시 렌더 후 백그라운드 갱신
   const fns = { dash: loadDash, ledger: loadLedger, assets: loadAssets,
      goals: loadGoals, analysis: loadAnalysis, activity: loadActivity, settings: loadSettings };
   fns[pg]?.();
+}
+// 탭 전환 시 즉시 캐시 렌더 (서버 대기 없음)
+function goFast(pg) {
+  go(pg);
 }
 const isActive = pg => !!$('pg-' + pg)?.classList.contains('on');
 
@@ -1460,8 +1464,8 @@ async function loadDash() {
     S.budgets = cached.data.budgets || {};
     renderDash(cached.data);
     $('warn-area').innerHTML = '';
-    // 캐시가 20초 이내면 서버 재요청 안 함
-    if (Date.now() - cached.ts < 20000) return;
+    // 캐시가 60초 이내면 서버 재요청 안 함
+    if (Date.now() - cached.ts < 60000) return;
   } else {
     $('dash-time').textContent = '로딩 중...';
     $('warn-area').innerHTML = '';
@@ -1923,8 +1927,12 @@ function refreshCalDay(dateStr) {
 // 자산
 // ══════════════════════════════════════════════════════
 async function loadAssets() {
+  // 캐시된 데이터 즉시 표시
+  const assetCached = MEM_CACHE['getAssets'];
+  if (assetCached && Date.now() - assetCached.ts < CACHE_MS.getAssets) {
+    S.assets = assetCached.data;
+  }
   if (S.assets.length > 0) {
-    // 기존 자산 데이터 즉시 표시
     const tot=S.assets.reduce((s,a)=>s+a.currentValue,0);
     const cost=S.assets.reduce((s,a)=>s+(a.purchaseValue||a.currentValue),0);
     const prf=tot-cost;
@@ -1932,6 +1940,9 @@ async function loadAssets() {
     $('a-prf').textContent=(prf>=0?'+':'')+fmt(prf);
     $('a-prf').className='mv '+(prf>=0?'g':'r');
     $('a-rt').textContent=cost>0?((prf/cost)*100).toFixed(1)+'%':'—';
+    renderAssetList(); // 즉시 렌더
+    // 캐시 유효하면 서버 재요청 안 함
+    if (assetCached && Date.now() - assetCached.ts < CACHE_MS.getAssets) return;
   } else if (!$('asset-list').children.length) {
     $('asset-list').innerHTML = '<div class="empty">로딩 중...</div>';
   }
@@ -1947,85 +1958,103 @@ async function loadAssets() {
     $('a-prf').className   = 'mv ' + (prf >= 0 ? 'g' : 'r');
     $('a-rt').textContent  = cost > 0 ? ((prf / cost) * 100).toFixed(1) + '%' : '—';
 
-    const byType = {};
-    S.assets.forEach(a => (byType[a.type] = byType[a.type] || []).push(a));
-    // 유형별 고유 색상
-    const TYPE_COLORS = {
-      '예금/현금':  { bg:'rgba(52,211,153,.12)',  border:'rgba(52,211,153,.35)',  text:'#34d399' },
-      '주식/ETF':   { bg:'rgba(79,142,247,.12)',  border:'rgba(79,142,247,.35)',  text:'#4f8ef7' },
-      '부동산':     { bg:'rgba(251,191,36,.12)',   border:'rgba(251,191,36,.35)',  text:'#fbbf24' },
-      '자동차':     { bg:'rgba(167,139,250,.12)',  border:'rgba(167,139,250,.35)', text:'#a78bfa' },
-      '적금/보험':  { bg:'rgba(251,146,60,.12)',   border:'rgba(251,146,60,.35)',  text:'#fb923c' },
-      '기타':       { bg:'rgba(148,163,184,.12)',  border:'rgba(148,163,184,.35)', text:'#94a3b8' },
-    };
-    // 열림/닫힘 상태 유지
-    if (!S._assetOpen) S._assetOpen = {};
-    // 처음엔 첫 번째 유형만 열기
-    if (Object.keys(S._assetOpen).length === 0) {
-      const firstType = Object.keys(byType)[0];
-      if (firstType) S._assetOpen[firstType] = true;
-    }
-
-    $('asset-list').innerHTML = S.assets.length
-      ? Object.entries(byType).map(([type, items]) => {
-          const subtotal = items.reduce((s, a) => s + a.currentValue, 0);
-          const subCost  = items.reduce((s, a) => s + (a.purchaseValue || a.currentValue), 0);
-          const subPrf   = subtotal - subCost;
-          const clr  = TYPE_COLORS[type] || TYPE_COLORS['기타'];
-          const open = S._assetOpen[type] !== false; // 기본 열림
-          const safeType = esc(type);
-          return `<div style="margin-bottom:10px;border-radius:var(--r);overflow:hidden;border:1.5px solid ${clr.border};">
-            <!-- 헤더 — 클릭으로 토글 -->
-            <div onclick="toggleAssetType('${safeType}')"
-              style="display:flex;justify-content:space-between;align-items:center;
-                padding:12px 16px;background:${clr.bg};cursor:pointer;
-                -webkit-tap-highlight-color:rgba(0,0,0,.05);">
-              <div style="display:flex;align-items:center;gap:10px;">
-                <span style="font-size:20px">${aIcon(type)}</span>
-                <div>
-                  <div style="font-size:14px;font-weight:700;color:${clr.text}">${type}</div>
-                  <div style="font-size:11px;color:var(--muted)">${items.length}개 항목</div>
-                </div>
-              </div>
-              <div style="display:flex;align-items:center;gap:10px;">
-                <div style="text-align:right">
-                  <div style="font-size:15px;font-weight:800;color:${clr.text}">${fmt(subtotal)}원</div>
-                  ${subPrf !== 0 ? `<div style="font-size:11px;font-weight:600;
-                    color:${subPrf>=0?'var(--green)':'var(--red)'}">
-                    ${subPrf>=0?'▲ +':'▼ '}${fmt(Math.abs(subPrf))}원</div>` : ''}
-                </div>
-                <span style="font-size:18px;color:${clr.text};transition:transform .2s;
-                  transform:rotate(${open?'180':'0'}deg);display:inline-block;">
-                  ▾
-                </span>
-              </div>
-            </div>
-            <!-- 항목 목록 — 아코디언 -->
-            <div id="asset-type-${safeType}"
-              style="display:${open?'block':'none'};background:var(--bg2);">
-              ${items.map(a => {
-                const r = a.purchaseValue > 0
-                  ? ((a.currentValue - a.purchaseValue) / a.purchaseValue * 100).toFixed(1) : null;
-                return `<div class="ti" style="border-radius:0;border:none;border-bottom:1px solid var(--border);margin:0;"
-                  onclick="openEditAsset('${esc(a.id)}','${esc(a.name)}','${esc(a.type)}','${esc(a.institution||'')}',${a.currentValue},${a.purchaseValue},'${esc(a.memo||'')}')">
-                  <div class="tif">
-                    <div class="tin">${a.name}</div>
-                    <div class="tic2">${a.institution||'-'}${a.memo?' · '+a.memo:''}</div>
-                  </div>
-                  <div style="text-align:right;flex-shrink:0;">
-                    <div style="font-weight:700;font-size:14px">${fmt(a.currentValue)}원</div>
-                    ${r!==null?`<div style="font-size:11px;color:${Number(r)>=0?'var(--green)':'var(--red)'}">
-                      ${Number(r)>=0?'+':''}${r}%</div>`:''}
-                  </div>
-                </div>`;
-              }).join('')}
-            </div>
-          </div>`;
-        }).join('')
-      : '<div class="empty"><div class="ei">🏦</div>자산을 추가해보세요</div>';
+    renderAssetList();
   } catch(e) {
     $('asset-list').innerHTML = `<div class="empty"><div class="ei">⚠️</div>${e.message}</div>`;
   }
+}
+
+function renderAssetList() {
+  const el = $('asset-list');
+  if (!el) return;
+  if (!S.assets.length) {
+    el.innerHTML = '<div class="empty"><div class="ei">🏦</div>자산을 추가해보세요</div>';
+    return;
+  }
+  const TYPE_COLORS = {
+    '예금/현금': {bg:'rgba(52,211,153,.12)', border:'rgba(52,211,153,.35)', text:'#34d399'},
+    '주식/ETF':  {bg:'rgba(79,142,247,.12)', border:'rgba(79,142,247,.35)', text:'#4f8ef7'},
+    '부동산':    {bg:'rgba(251,191,36,.12)',  border:'rgba(251,191,36,.35)', text:'#fbbf24'},
+    '자동차':    {bg:'rgba(167,139,250,.12)', border:'rgba(167,139,250,.35)',text:'#a78bfa'},
+    '적금/보험': {bg:'rgba(251,146,60,.12)',  border:'rgba(251,146,60,.35)', text:'#fb923c'},
+    '기타':      {bg:'rgba(148,163,184,.12)', border:'rgba(148,163,184,.35)',text:'#94a3b8'},
+  };
+  const byType = {};
+  S.assets.forEach(a => { (byType[a.type] = byType[a.type] || []).push(a); });
+
+  if (!S._assetOpen) S._assetOpen = {};
+  if (Object.keys(S._assetOpen).length === 0) {
+    const first = Object.keys(byType)[0];
+    if (first) S._assetOpen[first] = true;
+  }
+
+  el.innerHTML = '';
+  Object.entries(byType).forEach(function([type, items]) {
+    const subtotal = items.reduce((s,a) => s + a.currentValue, 0);
+    const subCost  = items.reduce((s,a) => s + (a.purchaseValue || a.currentValue), 0);
+    const subPrf   = subtotal - subCost;
+    const clr      = TYPE_COLORS[type] || TYPE_COLORS['기타'];
+    const open     = S._assetOpen[type] !== false;
+    const safeType = esc(type);
+
+    // ── 그룹 래퍼 ──────────────────────────────────────────────
+    const group = document.createElement('div');
+    group.style.cssText = 'margin-bottom:10px;border-radius:var(--r);overflow:hidden;border:1.5px solid ' + clr.border + ';';
+
+    // ── 헤더 ──────────────────────────────────────────────────
+    const hdr = document.createElement('div');
+    hdr.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:12px 16px;background:' + clr.bg + ';cursor:pointer;';
+    hdr.addEventListener('click', function() { toggleAssetType(safeType); });
+
+    const hLeft = document.createElement('div');
+    hLeft.style.cssText = 'display:flex;align-items:center;gap:10px;';
+    hLeft.innerHTML = '<span style="font-size:20px">' + aIcon(type) + '</span>'
+      + '<div><div style="font-size:14px;font-weight:700;color:' + clr.text + '">' + type + '</div>'
+      + '<div style="font-size:11px;color:var(--muted)">' + items.length + '개 항목</div></div>';
+
+    const hRight = document.createElement('div');
+    hRight.style.cssText = 'display:flex;align-items:center;gap:10px;';
+    const prfColor = subPrf >= 0 ? 'var(--green)' : 'var(--red)';
+    const prfSign  = subPrf >= 0 ? '▲ +' : '▼ ';
+    hRight.innerHTML = '<div style="text-align:right">'
+      + '<div style="font-size:15px;font-weight:800;color:' + clr.text + '">' + fmt(subtotal) + '원</div>'
+      + (subPrf !== 0 ? '<div style="font-size:11px;font-weight:600;color:' + prfColor + '">' + prfSign + fmt(Math.abs(subPrf)) + '원</div>' : '')
+      + '</div>'
+      + '<span id="arr-' + safeType + '" style="font-size:18px;color:' + clr.text + ';display:inline-block;transition:transform .2s;transform:rotate(' + (open ? 180 : 0) + 'deg)">▾</span>';
+
+    hdr.appendChild(hLeft);
+    hdr.appendChild(hRight);
+    group.appendChild(hdr);
+
+    // ── 아코디언 바디 ─────────────────────────────────────────
+    const body = document.createElement('div');
+    body.id = 'asset-type-' + safeType;
+    body.style.cssText = 'display:' + (open ? 'block' : 'none') + ';background:var(--bg2);';
+
+    items.forEach(function(a) {
+      const pct = a.purchaseValue > 0
+        ? ((a.currentValue - a.purchaseValue) / a.purchaseValue * 100).toFixed(1) : null;
+      const row = document.createElement('div');
+      row.className = 'ti';
+      row.style.cssText = 'border-radius:0;border:none;border-bottom:1px solid var(--border);margin:0;cursor:pointer;';
+      row.addEventListener('click', function() {
+        openEditAsset(a.id, a.name, a.type, a.institution||'', a.currentValue, a.purchaseValue, a.memo||'');
+      });
+      const pctColor = pct !== null ? (Number(pct) >= 0 ? 'var(--green)' : 'var(--red)') : '';
+      row.innerHTML = '<div class="tif">'
+        + '<div class="tin">' + a.name + '</div>'
+        + '<div class="tic2">' + (a.institution||'-') + (a.memo ? ' · ' + a.memo : '') + '</div>'
+        + '</div>'
+        + '<div style="text-align:right;flex-shrink:0;">'
+        + '<div style="font-weight:700;font-size:14px">' + fmt(a.currentValue) + '원</div>'
+        + (pct !== null ? '<div style="font-size:11px;color:' + pctColor + '">' + (Number(pct) >= 0 ? '+' : '') + pct + '%</div>' : '')
+        + '</div>';
+      body.appendChild(row);
+    });
+
+    group.appendChild(body);
+    el.appendChild(group);
+  });
 }
 
 function toggleAssetType(type) {
@@ -3404,42 +3433,64 @@ function pickMeMob(name) {
   initMems(null);
   setupMobileUI();
 
-  // ── 앱 시작 시 모든 데이터 즉시 병렬 프리로드 ──────────────────
+  // ── 앱 시작: getAll 1회 요청으로 모든 데이터 로드 ──────────────
   async function preloadAll() {
-    const now = new Date();
-    const thisYM = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+    const now   = new Date();
+    const thisYM = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0');
     const prevM  = new Date(now.getFullYear(), now.getMonth()-1, 1);
-    const prevYM = `${prevM.getFullYear()}-${String(prevM.getMonth()+1).padStart(2,'0')}`;
+    const prevYM = prevM.getFullYear() + '-' + String(prevM.getMonth()+1).padStart(2,'0');
 
-    // 모든 API 동시 호출
-    const [dash, ledger, prevLedger, assets, goals, cats, pays, budgets] = await Promise.allSettled([
-      call({ action: 'getDashboard' }),
-      call({ action: 'getLedger', month: thisYM }),
-      call({ action: 'getLedger', month: prevYM }),
-      call({ action: 'getAssets' }),
-      call({ action: 'getGoals' }),
-      call({ action: 'getCategories' }),
-      call({ action: 'getPayMethods' }),
-      call({ action: 'getBudgets' }),
-    ]);
+    try {
+      // ★ 단 1번 요청으로 모든 초기 데이터 수신
+      const all = await call({ action: 'getAll', month: thisYM });
+      if (!all) return;
 
-    // 결과 캐싱
-    if (dash.status==='fulfilled')      { /* getDashboard 캐시는 call() 내부에서 처리됨 */ }
-    if (ledger.status==='fulfilled')    { MEM_CACHE['getLedger_'+thisYM] = { ts:Date.now(), data:ledger.value||[] }; S.ledger = ledger.value||[]; }
-    if (prevLedger.status==='fulfilled'){ MEM_CACHE['getLedger_'+prevYM] = { ts:Date.now(), data:prevLedger.value||[] }; }
-    if (assets.status==='fulfilled')    { S.assets = assets.value||[]; }
-    if (goals.status==='fulfilled')     { S.goals  = goals.value||[]; }
-    if (cats.status==='fulfilled' && cats.value) {
-      if (cats.value.expense) ECATS = cats.value.expense.map(c=>c.name);
-      if (cats.value.income)  ICATS = cats.value.income.map(c=>c.name);
+      // 대시보드
+      if (all.dash) {
+        MEM_CACHE['getDashboard'] = { ts: Date.now(), data: all.dash };
+        initMems(all.dash.members || null);
+        S.budgets = all.dash.budgets || {};
+        renderDash(all.dash);
+      }
+      // 가계부
+      if (all.ledger) {
+        S.ledger = all.ledger;
+        MEM_CACHE['getLedger_' + thisYM] = { ts: Date.now(), data: all.ledger };
+      }
+      // 자산
+      if (all.assets) {
+        S.assets = all.assets;
+        MEM_CACHE['getAssets'] = { ts: Date.now(), data: all.assets };
+      }
+      // 목표
+      if (all.goals) {
+        S.goals = all.goals;
+        MEM_CACHE['getGoals'] = { ts: Date.now(), data: all.goals };
+      }
+      // 카테고리/결제수단
+      if (all.cats) {
+        if (all.cats.expense) { ECATS = all.cats.expense.map(c=>c.name); ICATS = all.cats.income.map(c=>c.name); }
+        if (all.cats.expense) all.cats.expense.forEach(c => { if(c.icon) ICONS[c.name]=c.icon; });
+        MEM_CACHE['getCategories'] = { ts: Date.now(), data: all.cats };
+      }
+      if (all.pays && all.pays.length) {
+        PAYS = all.pays;
+        MEM_CACHE['getPayMethods'] = { ts: Date.now(), data: all.pays };
+      }
+
+      // 이전 달 가계부는 백그라운드로 별도 로드
+      call({ action: 'getLedger', month: prevYM })
+        .then(d => { if(d) MEM_CACHE['getLedger_'+prevYM] = { ts:Date.now(), data:d }; })
+        .catch(()=>{});
+
+    } catch(e) {
+      // getAll 실패 시 개별 요청으로 폴백
+      loadDash();
     }
-    if (pays.status==='fulfilled' && Array.isArray(pays.value) && pays.value.length) PAYS = pays.value;
-    if (budgets.status==='fulfilled' && budgets.value) S.budgets = budgets.value;
   }
 
-  // 대시보드 로딩과 프리로드 동시 실행
-  loadDash();
-  preloadAll().catch(()=>{});
+  // preloadAll 먼저, 대시보드는 preloadAll 안에서 렌더
+  preloadAll().catch(()=>{ loadDash(); });
   startPoll();
 
   window.addEventListener('resize', () => {
